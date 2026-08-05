@@ -184,6 +184,7 @@ jobs:
     - name: Upload SARIF to GitHub Security
       if: steps.changes.outputs.count != '0'
       uses: github/codeql-action/upload-sarif@v4
+      
       with:
         sarif_file: result.sarif
         category: cortex-appsec
