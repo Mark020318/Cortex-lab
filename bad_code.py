@@ -20,3 +20,4 @@ def get_user():
     cursor = conn.cursor()
     cursor.execute("SELECT * FROM users WHERE id = '" + user_id + "'")
     return str(cursor.fetchall())
+#123
