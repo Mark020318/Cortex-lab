@@ -1,10 +1,10 @@
-name: Cortex CLI Code Scan (Incremental on PR / Full on main)
+name: Cortex CLI Code Scan (Changed Files Only)
 
 on:
   push:
     branches:
-      - main          # 只有預設分支做「全量掃描 + 上傳 SARIF」
-  pull_request:       # PR 做「增量掃描」，不上傳 SARIF（避免告警被誤判為已修復）
+      - '**'
+  pull_request:
   workflow_dispatch:
     inputs:
       debug:
@@ -15,9 +15,8 @@ on:
 env:
   CORTEX_API_URL: https://api-zot-xsiam-nfr.xdr.us.paloaltonetworks.com
   CORTEX_API_KEY_ID: ${{ secrets.CORTEX_API_KEY_ID }}
-  CORTEX_API_KEY: ${{ secrets.CORTEX_API_KEY_SECRET }}   
+  CORTEX_API_KEY: ${{ secrets.CORTEX_API_KEY_SECRET }}
 
-# 同一分支重複 push 時取消舊的 run，省 runner 時間
 concurrency:
   group: cortex-scan-${{ github.ref }}
   cancel-in-progress: true
@@ -29,74 +28,109 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
-      actions: read            # private repo 上傳 SARIF 需要
+      actions: read
       security-events: write
 
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v6        # v5 起才是 node24 原生（v4 會噴 Node.js 20 deprecated 警告）
+        uses: actions/checkout@v6
         with:
-          fetch-depth: 0                 # git diff 需要完整歷史
+          fetch-depth: 0
 
-      # ── 官方新版新增的關鍵步驟：CLI 的 AppSec 引擎需要 Node.js 22 ──
       - name: Set up Node.js
-        uses: actions/setup-node@v6      # v6 起才是 node24 原生
+        uses: actions/setup-node@v6
         with:
-          node-version: 22               # 這是「要裝給 cortexcli 用的 Node」，跟 action 自己跑在哪個 Node 無關
+          node-version: 22
+          package-manager-cache: false   # 這個 job 有 secrets，關掉自動快取比較安全
 
       - name: Verify Node.js Version
         run: node -v
 
-      # ── 決定這次是增量還是全量 ──
-      - name: Decide scan mode
-        id: mode
-        run: |
-          set -eu
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            echo "incremental=true" >> "$GITHUB_OUTPUT"
-          else
-            echo "incremental=false" >> "$GITHUB_OUTPUT"
-          fi
-
-      # ── 只在 PR 時收集變更檔案（用 git diff，不需要 curl + jq 打 API）──
+      # ── 1. 找出這次動到哪些檔案 ──
       - name: Collect changed files
         id: changes
-        if: steps.mode.outputs.incremental == 'true'
         run: |
           set -euo pipefail
-          BASE_SHA="${{ github.event.pull_request.base.sha }}"
 
-          # ACMR = Added / Copied / Modified / Renamed，排除已刪除的檔案
-          git diff --name-only --diff-filter=ACMR "$BASE_SHA" HEAD \
-            | sort -u > changed_files.txt
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            BRANCH="${{ github.head_ref }}"
+            BASE="${{ github.event.pull_request.base.sha }}"
+          else
+            BRANCH="${{ github.ref_name }}"
+            BASE="${{ github.event.before }}"
+          fi
 
-          echo "=== Changed Files ==="
-          cat changed_files.txt
-          echo "count=$(wc -l < changed_files.txt)" >> "$GITHUB_OUTPUT"
+          valid() { [ -n "${1:-}" ] && git cat-file -e "${1}^{commit}" 2>/dev/null; }
+
+          # 新分支 / force push 時 github.event.before 不可用，退回跟預設分支比
+          if ! valid "$BASE"; then
+            DEF="origin/${{ github.event.repository.default_branch }}"
+            if git rev-parse --verify "$DEF" >/dev/null 2>&1; then
+              BASE=$(git merge-base "$DEF" HEAD 2>/dev/null || echo "")
+            fi
+          fi
+          # 再不行就比上一個 commit
+          if ! valid "$BASE" || [ "$BASE" = "$(git rev-parse HEAD)" ]; then
+            BASE=$(git rev-parse HEAD~1 2>/dev/null || echo "")
+          fi
+
+          : > touched_files.txt
+          : > changed_files.txt
+
+          if valid "$BASE"; then
+            # touched = 動到的所有路徑（含刪除、rename 前的舊路徑）
+            git diff --name-only --no-renames "$BASE" HEAD | sort -u > touched_files.txt
+            # changed = 真的要送進掃描器的檔案
+            git diff --name-only --no-renames --diff-filter=ACM "$BASE" HEAD | sort -u > changed_files.txt
+          else
+            echo "::warning::無法決定 diff 基準，這次不掃描"
+          fi
+
+          echo "=== Touched ==="; cat touched_files.txt
+          echo "=== To scan ==="; cat changed_files.txt
+          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
+          echo "count=$(wc -l < changed_files.txt | tr -d ' ')" >> "$GITHUB_OUTPUT"
+
+      # ── 2. 取回上次的結果當基準線（只為了讓上傳的 SARIF 是完整的，不會多掃任何東西）──
+      - name: Restore SARIF baseline
+        uses: actions/cache/restore@v5
+        with:
+          path: baseline.sarif
+          key: cortex-baseline-${{ steps.changes.outputs.branch }}-${{ github.run_id }}
+          restore-keys: |
+            cortex-baseline-${{ steps.changes.outputs.branch }}-
+            cortex-baseline-${{ github.event.repository.default_branch }}-
 
       - name: Prepare scan directory
-        if: steps.mode.outputs.incremental == 'true' && steps.changes.outputs.count != '0'
+        if: steps.changes.outputs.count != '0'
         run: |
           set -euo pipefail
           mkdir -p _cortex_changed
+
           while IFS= read -r file; do
             [ -f "$file" ] || continue
             mkdir -p "_cortex_changed/$(dirname "$file")"
             cp "$file" "_cortex_changed/$file"
           done < changed_files.txt
 
-          # 一併帶上相依性清單，SCA / 套件掃描才不會因為缺 lock file 失效
+          # 帶上相依性清單，否則套件層掃描會因為缺 lock file 失效。
+          # 帶進去的檔案要一起列入 touched，不然會跟基準線的舊結果重複。
           for manifest in package.json package-lock.json yarn.lock pnpm-lock.yaml \
                           requirements.txt Pipfile.lock poetry.lock \
                           go.mod go.sum pom.xml build.gradle Gemfile.lock composer.lock; do
-            [ -f "$manifest" ] && cp "$manifest" "_cortex_changed/" || true
+            if [ -f "$manifest" ] && [ ! -f "_cortex_changed/$manifest" ]; then
+              cp "$manifest" "_cortex_changed/$manifest"
+              echo "$manifest" >> touched_files.txt
+            fi
           done
+          sort -u -o touched_files.txt touched_files.txt
 
           echo "Files prepared: $(find _cortex_changed -type f | wc -l)"
 
       - name: Download cortexcli
+        if: steps.changes.outputs.count != '0'
         run: |
-          set -eu   # 不要用 -x，避免把 header 內容印進 log
+          set -eu   # 不要用 -x，避免把 header 印進 log
           crtx_resp=$(curl -sS --fail \
             "${CORTEX_API_URL}/public_api/v1/unified-cli/releases/download-link?os=linux&architecture=amd64" \
             -H "x-xdr-auth-id: ${CORTEX_API_KEY_ID}" \
@@ -110,19 +144,13 @@ jobs:
 
           curl -sS --fail -o cortexcli "$crtx_url"
           chmod +x cortexcli
-          ./cortexcli --version    # 官方新版有加，方便對版本
+          ./cortexcli --version
 
-      - name: Run Cortex CLI Code Scan
-        # PR 沒有任何變更檔（例如只刪檔）就直接跳過，不要送空掃描
-        if: steps.mode.outputs.incremental == 'false' || steps.changes.outputs.count != '0'
+      # ── 3. 只掃 _cortex_changed，永遠不掃整個 repo ──
+      - name: Run Cortex CLI Code Scan (changed files only)
+        if: steps.changes.outputs.count != '0'
         run: |
           set -eu
-          if [ "${{ steps.mode.outputs.incremental }}" = "true" ]; then
-            SCAN_DIR="${{ github.workspace }}/_cortex_changed"
-          else
-            SCAN_DIR="${{ github.workspace }}"
-          fi
-
           LOG_ARGS=""
           if [ "${{ inputs.debug }}" = "true" ]; then
             LOG_ARGS="--log-level DEBUG"
@@ -134,38 +162,64 @@ jobs:
             --api-key "${CORTEX_API_KEY}" \
             --api-key-id "${CORTEX_API_KEY_ID}" \
             code scan \
-            --directory "$SCAN_DIR" \
+            --directory "${{ github.workspace }}/_cortex_changed" \
             --repo-id "${{ github.repository }}" \
-            --branch "${{ github.ref_name }}" \
+            --branch "${{ steps.changes.outputs.branch }}" \
             --source "GITHUB_ACTIONS" \
             --create-repo-if-missing \
             --upload-mode upload \
             --output sarif \
-            --output-file-path "${{ github.workspace }}/result.sarif"
+            --output-file-path "${{ github.workspace }}/scan.sarif"
 
-          test -f "${{ github.workspace }}/result.sarif"
+          test -f "${{ github.workspace }}/scan.sarif"
 
-      # ── 增量掃描時 SARIF 路徑會變成 _cortex_changed/xxx，要還原成真實路徑 ──
-      - name: Normalize SARIF paths
-        if: steps.mode.outputs.incremental == 'true' && hashFiles('result.sarif') != ''
+      # ── 4. 還原 SARIF 路徑，並把沒動到的檔案的既有結果接回來 ──
+      - name: Merge scan result with baseline
         run: |
           set -eu
-          jq '(.. | objects | select(has("uri")) | .uri) |=
-                (sub("^_cortex_changed/"; "") | sub("^.*/_cortex_changed/"; ""))' \
-            result.sarif > result.normalized.sarif
-          mv result.normalized.sarif result.sarif
+          touch touched_files.txt
+
+          if [ ! -f scan.sarif ] && [ ! -f baseline.sarif ]; then
+            echo "沒有掃描結果也沒有基準線，跳過上傳"
+            exit 0
+          fi
+
+          python3 .github/scripts/merge_sarif.py \
+            baseline.sarif scan.sarif touched_files.txt result.sarif | tee merge.log
+
+          cp result.sarif baseline.sarif
+
+          {
+            echo "### Cortex Code Scan（僅變更檔）"
+            echo ""
+            echo "- 本次掃描檔案數：\`${{ steps.changes.outputs.count }}\`"
+            echo "- $(cat merge.log)"
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Save SARIF baseline
+        if: success() && hashFiles('baseline.sarif') != ''
+        continue-on-error: true      # fork PR 沒有寫入權限，失敗不影響掃描
+        uses: actions/cache/save@v5
+        with:
+          path: baseline.sarif
+          key: cortex-baseline-${{ steps.changes.outputs.branch }}-${{ github.run_id }}
 
       - name: Upload SARIF artifact
         if: always() && hashFiles('result.sarif') != ''
-        uses: actions/upload-artifact@v6   # 注意：v5 只有「預備支援」，預設仍跑 node20，要 v6 起才乾淨
+        uses: actions/upload-artifact@v6
         with:
           name: cortex-sarif-${{ github.run_id }}
-          path: result.sarif
+          path: |
+            result.sarif
+            scan.sarif
           retention-days: 14
 
-      # ── 只有全量掃描才上傳到 Code Scanning，否則會把沒掃到的檔案的告警標成 fixed ──
       - name: Upload SARIF to GitHub Security
-        if: steps.mode.outputs.incremental == 'false' && hashFiles('result.sarif') != ''
+        # fork 來的 PR 沒有 security-events: write，會直接失敗，所以跳過
+        if: >-
+          hashFiles('result.sarif') != '' &&
+          (github.event_name != 'pull_request' ||
+           github.event.pull_request.head.repo.full_name == github.repository)
         uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: result.sarif
