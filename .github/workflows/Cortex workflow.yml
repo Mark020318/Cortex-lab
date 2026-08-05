@@ -6,20 +6,11 @@ on:
       - '**'
   pull_request:
   workflow_dispatch:
-    inputs:
-      debug:
-        description: '開啟 CLI DEBUG log'
-        type: boolean
-        default: false
 
 env:
-  CORTEX_API_URL: https://api-zot-xsiam-nfr.xdr.us.paloaltonetworks.com
-  CORTEX_API_KEY_ID: ${{ secrets.CORTEX_API_KEY_ID }}
+  CORTEX_API_URL: ${{ secrets.CORTEX_API_BASE_URL }}
   CORTEX_API_KEY: ${{ secrets.CORTEX_API_KEY_SECRET }}
-
-concurrency:
-  group: cortex-scan-${{ github.ref }}
-  cancel-in-progress: true
+  CORTEX_API_KEY_ID: ${{ secrets.CORTEX_API_KEY_ID }}
 
 jobs:
   cortex-code-scan:
@@ -27,200 +18,97 @@ jobs:
 
     permissions:
       contents: read
-      pull-requests: read
       actions: read
       security-events: write
 
     steps:
-      - name: Checkout Repository
-        uses: actions/checkout@v6
-        with:
-          fetch-depth: 0
+    - name: Checkout Repository
+      uses: actions/checkout@v6
+      with:
+        fetch-depth: 0          # git diff 需要歷史
 
-      - name: Set up Node.js
-        uses: actions/setup-node@v6
-        with:
-          node-version: 22
-          package-manager-cache: false   # 這個 job 有 secrets，關掉自動快取比較安全
+    - name: Set up Node.js
+      uses: actions/setup-node@v6
+      with:
+        node-version: 22
 
-      - name: Verify Node.js Version
-        run: node -v
+    - name: Verify Node.js Version
+      run: node -v
 
-      # ── 1. 找出這次動到哪些檔案 ──
-      - name: Collect changed files
-        id: changes
-        run: |
-          set -euo pipefail
+    - name: Collect changed files
+      id: changes
+      run: |
+        set -e
+        if [ "${{ github.event_name }}" = "pull_request" ]; then
+          BASE="${{ github.event.pull_request.base.sha }}"
+        else
+          BASE="${{ github.event.before }}"
+        fi
+        # 新分支 / force push 時 BASE 不存在，退回比上一個 commit
+        git cat-file -e "${BASE}^{commit}" 2>/dev/null || \
+          BASE=$(git rev-parse HEAD~1 2>/dev/null || git hash-object -t tree /dev/null)
 
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            BRANCH="${{ github.head_ref }}"
-            BASE="${{ github.event.pull_request.base.sha }}"
-          else
-            BRANCH="${{ github.ref_name }}"
-            BASE="${{ github.event.before }}"
-          fi
+        git diff --name-only --diff-filter=ACM "$BASE" HEAD > changed.txt
+        echo "=== Changed files ==="
+        cat changed.txt
 
-          valid() { [ -n "${1:-}" ] && git cat-file -e "${1}^{commit}" 2>/dev/null; }
+        mkdir -p _cortex_scan
+        while IFS= read -r f; do
+          [ -f "$f" ] || continue
+          mkdir -p "_cortex_scan/$(dirname "$f")"
+          cp "$f" "_cortex_scan/$f"
+        done < changed.txt
 
-          # 新分支 / force push 時 github.event.before 不可用，退回跟預設分支比
-          if ! valid "$BASE"; then
-            DEF="origin/${{ github.event.repository.default_branch }}"
-            if git rev-parse --verify "$DEF" >/dev/null 2>&1; then
-              BASE=$(git merge-base "$DEF" HEAD 2>/dev/null || echo "")
-            fi
-          fi
-          # 再不行就比上一個 commit
-          if ! valid "$BASE" || [ "$BASE" = "$(git rev-parse HEAD)" ]; then
-            BASE=$(git rev-parse HEAD~1 2>/dev/null || echo "")
-          fi
+        echo "count=$(find _cortex_scan -type f | wc -l)" >> "$GITHUB_OUTPUT"
 
-          : > touched_files.txt
-          : > changed_files.txt
+    - name: Download cortexcli
+      if: steps.changes.outputs.count != '0'
+      run: |
+        set -e
+        crtx_resp=$(curl -sS "${CORTEX_API_URL}/public_api/v1/unified-cli/releases/download-link?os=linux&architecture=amd64" \
+          -H "x-xdr-auth-id: ${CORTEX_API_KEY_ID}" \
+          -H "Authorization: ${CORTEX_API_KEY}")
+        crtx_url=$(echo "$crtx_resp" | jq -r ".signed_url")
+        curl -sS -o cortexcli "$crtx_url"
+        chmod +x cortexcli
+        ./cortexcli --version
 
-          if valid "$BASE"; then
-            # touched = 動到的所有路徑（含刪除、rename 前的舊路徑）
-            git diff --name-only --no-renames "$BASE" HEAD | sort -u > touched_files.txt
-            # changed = 真的要送進掃描器的檔案
-            git diff --name-only --no-renames --diff-filter=ACM "$BASE" HEAD | sort -u > changed_files.txt
-          else
-            echo "::warning::無法決定 diff 基準，這次不掃描"
-          fi
+    - name: Run Cortex CLI Code Scan
+      if: steps.changes.outputs.count != '0'
+      run: |
+        ./cortexcli \
+          --api-base-url "${CORTEX_API_URL}" \
+          --api-key "${CORTEX_API_KEY}" \
+          --api-key-id "${CORTEX_API_KEY_ID}" \
+          code scan \
+          --directory "${{ github.workspace }}/_cortex_scan" \
+          --repo-id "${{ github.repository }}" \
+          --branch "${{ github.head_ref || github.ref_name }}" \
+          --source "GITHUB_ACTIONS" \
+          --create-repo-if-missing \
+          --output sarif \
+          --output-file-path "${{ github.workspace }}/scan.sarif"
 
-          echo "=== Touched ==="; cat touched_files.txt
-          echo "=== To scan ==="; cat changed_files.txt
-          echo "branch=$BRANCH" >> "$GITHUB_OUTPUT"
-          echo "count=$(wc -l < changed_files.txt | tr -d ' ')" >> "$GITHUB_OUTPUT"
+    - name: Fix SARIF paths
+      if: steps.changes.outputs.count != '0'
+      run: |
+        python3 - <<'PY'
+        import json, re
+        def fix(o):
+            if isinstance(o, dict):
+                o.pop("originalUriBaseIds", None)
+                return {k: fix(v) for k, v in o.items()}
+            if isinstance(o, list):
+                return [fix(v) for v in o]
+            if isinstance(o, str):
+                return re.sub(r"^.*_cortex_scan/", "", o)
+            return o
+        json.dump(fix(json.load(open("scan.sarif"))), open("result.sarif", "w"))
+        PY
 
-      # ── 2. 取回上次的結果當基準線（只為了讓上傳的 SARIF 是完整的，不會多掃任何東西）──
-      - name: Restore SARIF baseline
-        uses: actions/cache/restore@v5
-        with:
-          path: baseline.sarif
-          key: cortex-baseline-${{ steps.changes.outputs.branch }}-${{ github.run_id }}
-          restore-keys: |
-            cortex-baseline-${{ steps.changes.outputs.branch }}-
-            cortex-baseline-${{ github.event.repository.default_branch }}-
-
-      - name: Prepare scan directory
-        if: steps.changes.outputs.count != '0'
-        run: |
-          set -euo pipefail
-          mkdir -p _cortex_changed
-
-          while IFS= read -r file; do
-            [ -f "$file" ] || continue
-            mkdir -p "_cortex_changed/$(dirname "$file")"
-            cp "$file" "_cortex_changed/$file"
-          done < changed_files.txt
-
-          # 帶上相依性清單，否則套件層掃描會因為缺 lock file 失效。
-          # 帶進去的檔案要一起列入 touched，不然會跟基準線的舊結果重複。
-          for manifest in package.json package-lock.json yarn.lock pnpm-lock.yaml \
-                          requirements.txt Pipfile.lock poetry.lock \
-                          go.mod go.sum pom.xml build.gradle Gemfile.lock composer.lock; do
-            if [ -f "$manifest" ] && [ ! -f "_cortex_changed/$manifest" ]; then
-              cp "$manifest" "_cortex_changed/$manifest"
-              echo "$manifest" >> touched_files.txt
-            fi
-          done
-          sort -u -o touched_files.txt touched_files.txt
-
-          echo "Files prepared: $(find _cortex_changed -type f | wc -l)"
-
-      - name: Download cortexcli
-        if: steps.changes.outputs.count != '0'
-        run: |
-          set -eu   # 不要用 -x，避免把 header 印進 log
-          crtx_resp=$(curl -sS --fail \
-            "${CORTEX_API_URL}/public_api/v1/unified-cli/releases/download-link?os=linux&architecture=amd64" \
-            -H "x-xdr-auth-id: ${CORTEX_API_KEY_ID}" \
-            -H "Authorization: ${CORTEX_API_KEY}")
-
-          crtx_url=$(echo "$crtx_resp" | jq -r ".signed_url")
-          if [ -z "$crtx_url" ] || [ "$crtx_url" = "null" ]; then
-            echo "Error: Failed to get signed URL"
-            exit 1
-          fi
-
-          curl -sS --fail -o cortexcli "$crtx_url"
-          chmod +x cortexcli
-          ./cortexcli --version
-
-      # ── 3. 只掃 _cortex_changed，永遠不掃整個 repo ──
-      - name: Run Cortex CLI Code Scan (changed files only)
-        if: steps.changes.outputs.count != '0'
-        run: |
-          set -eu
-          LOG_ARGS=""
-          if [ "${{ inputs.debug }}" = "true" ]; then
-            LOG_ARGS="--log-level DEBUG"
-          fi
-
-          ./cortexcli \
-            $LOG_ARGS \
-            --api-base-url "${CORTEX_API_URL}" \
-            --api-key "${CORTEX_API_KEY}" \
-            --api-key-id "${CORTEX_API_KEY_ID}" \
-            code scan \
-            --directory "${{ github.workspace }}/_cortex_changed" \
-            --repo-id "${{ github.repository }}" \
-            --branch "${{ steps.changes.outputs.branch }}" \
-            --source "GITHUB_ACTIONS" \
-            --create-repo-if-missing \
-            --upload-mode upload \
-            --output sarif \
-            --output-file-path "${{ github.workspace }}/scan.sarif"
-
-          test -f "${{ github.workspace }}/scan.sarif"
-
-      # ── 4. 還原 SARIF 路徑，並把沒動到的檔案的既有結果接回來 ──
-      - name: Merge scan result with baseline
-        run: |
-          set -eu
-          touch touched_files.txt
-
-          if [ ! -f scan.sarif ] && [ ! -f baseline.sarif ]; then
-            echo "沒有掃描結果也沒有基準線，跳過上傳"
-            exit 0
-          fi
-
-          python3 .github/scripts/merge_sarif.py \
-            baseline.sarif scan.sarif touched_files.txt result.sarif | tee merge.log
-
-          cp result.sarif baseline.sarif
-
-          {
-            echo "### Cortex Code Scan（僅變更檔）"
-            echo ""
-            echo "- 本次掃描檔案數：\`${{ steps.changes.outputs.count }}\`"
-            echo "- $(cat merge.log)"
-          } >> "$GITHUB_STEP_SUMMARY"
-
-      - name: Save SARIF baseline
-        if: success() && hashFiles('baseline.sarif') != ''
-        continue-on-error: true      # fork PR 沒有寫入權限，失敗不影響掃描
-        uses: actions/cache/save@v5
-        with:
-          path: baseline.sarif
-          key: cortex-baseline-${{ steps.changes.outputs.branch }}-${{ github.run_id }}
-
-      - name: Upload SARIF artifact
-        if: always() && hashFiles('result.sarif') != ''
-        uses: actions/upload-artifact@v6
-        with:
-          name: cortex-sarif-${{ github.run_id }}
-          path: |
-            result.sarif
-            scan.sarif
-          retention-days: 14
-
-      - name: Upload SARIF to GitHub Security
-        # fork 來的 PR 沒有 security-events: write，會直接失敗，所以跳過
-        if: >-
-          hashFiles('result.sarif') != '' &&
-          (github.event_name != 'pull_request' ||
-           github.event.pull_request.head.repo.full_name == github.repository)
-        uses: github/codeql-action/upload-sarif@v4
-        with:
-          sarif_file: result.sarif
-          category: cortex-appsec
+    - name: Upload SARIF to GitHub Security
+      if: steps.changes.outputs.count != '0'
+      uses: github/codeql-action/upload-sarif@v4
+      with:
+        sarif_file: result.sarif
+        category: cortex-appsec
