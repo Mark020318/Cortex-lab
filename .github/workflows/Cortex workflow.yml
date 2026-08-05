@@ -15,7 +15,7 @@ on:
 env:
   CORTEX_API_URL: https://api-zot-xsiam-nfr.xdr.us.paloaltonetworks.com
   CORTEX_API_KEY_ID: ${{ secrets.CORTEX_API_KEY_ID }}
-  CORTEX_API_KEY: ${{ secrets.CORTEX_API_KEY_SECRET }}   # ← 確認 Secret 名稱是否真的叫 CORTEX_API_KEY_SECRET
+  CORTEX_API_KEY: ${{ secrets.CORTEX_API_KEY_SECRET }}   
 
 # 同一分支重複 push 時取消舊的 run，省 runner 時間
 concurrency:
@@ -34,15 +34,15 @@ jobs:
 
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v4        # 目前最新是 v6，要升可以直接改
+        uses: actions/checkout@v6        # v5 起才是 node24 原生（v4 會噴 Node.js 20 deprecated 警告）
         with:
           fetch-depth: 0                 # git diff 需要完整歷史
 
       # ── 官方新版新增的關鍵步驟：CLI 的 AppSec 引擎需要 Node.js 22 ──
       - name: Set up Node.js
-        uses: actions/setup-node@v4
+        uses: actions/setup-node@v6      # v6 起才是 node24 原生
         with:
-          node-version: 22
+          node-version: 22               # 這是「要裝給 cortexcli 用的 Node」，跟 action 自己跑在哪個 Node 無關
 
       - name: Verify Node.js Version
         run: node -v
@@ -157,7 +157,7 @@ jobs:
 
       - name: Upload SARIF artifact
         if: always() && hashFiles('result.sarif') != ''
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v6   # 注意：v5 只有「預備支援」，預設仍跑 node20，要 v6 起才乾淨
         with:
           name: cortex-sarif-${{ github.run_id }}
           path: result.sarif
