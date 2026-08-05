@@ -1,19 +1,26 @@
-name: Cortex CLI Code Scan (Changed Files Only And Log)
+name: Cortex CLI Code Scan (Incremental on PR / Full on main)
 
 on:
   push:
     branches:
-      - '**'
-  pull_request:
+      - main          # 只有預設分支做「全量掃描 + 上傳 SARIF」
+  pull_request:       # PR 做「增量掃描」，不上傳 SARIF（避免告警被誤判為已修復）
   workflow_dispatch:
+    inputs:
+      debug:
+        description: '開啟 CLI DEBUG log'
+        type: boolean
+        default: false
 
 env:
-  # 🟢 1. 使用官方範例中的台灣區 API 網址
   CORTEX_API_URL: https://api-zot-xsiam-nfr.xdr.us.paloaltonetworks.com
-  
-  # GitHub Secrets
   CORTEX_API_KEY_ID: ${{ secrets.CORTEX_API_KEY_ID }}
-  CORTEX_API_KEY: ${{ secrets.CORTEX_API_KEY_SECRET }}
+  CORTEX_API_KEY: ${{ secrets.CORTEX_API_KEY_SECRET }}   # ← 確認 Secret 名稱是否真的叫 CORTEX_API_KEY_SECRET
+
+# 同一分支重複 push 時取消舊的 run，省 runner 時間
+concurrency:
+  group: cortex-scan-${{ github.ref }}
+  cancel-in-progress: true
 
 jobs:
   cortex-code-scan:
@@ -22,141 +29,144 @@ jobs:
     permissions:
       contents: read
       pull-requests: read
+      actions: read            # private repo 上傳 SARIF 需要
       security-events: write
 
     steps:
       - name: Checkout Repository
-        uses: actions/checkout@v4
+        uses: actions/checkout@v4        # 目前最新是 v6，要升可以直接改
         with:
-          fetch-depth: 0   # ⚠️ 必須設為 0，否則 git diff 抓不到歷史紀錄
+          fetch-depth: 0                 # git diff 需要完整歷史
 
-      - name: Install jq
+      # ── 官方新版新增的關鍵步驟：CLI 的 AppSec 引擎需要 Node.js 22 ──
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Verify Node.js Version
+        run: node -v
+
+      # ── 決定這次是增量還是全量 ──
+      - name: Decide scan mode
+        id: mode
         run: |
-          set -eux
-          sudo apt-get update
-          sudo apt-get install -y jq
+          set -eu
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            echo "incremental=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "incremental=false" >> "$GITHUB_OUTPUT"
+          fi
 
-      # 🟢 2. 找出哪些檔案被修改了
+      # ── 只在 PR 時收集變更檔案（用 git diff，不需要 curl + jq 打 API）──
       - name: Collect changed files
         id: changes
-        env:
-          GH_TOKEN: ${{ github.token }}
+        if: steps.mode.outputs.incremental == 'true'
         run: |
-          set -eux
-          mkdir -p _cortex_changed
-          rm -f changed_files.txt
+          set -euo pipefail
+          BASE_SHA="${{ github.event.pull_request.base.sha }}"
 
-          if [ "${{ github.event_name }}" = "pull_request" ]; then
-            echo "PR event detected"
-            PR_NUMBER="${{ github.event.pull_request.number }}"
-            OWNER_REPO="${{ github.repository }}"
-            
-            # 透過 GitHub API 抓取 PR 的變更檔案 (支援分頁)
-            page=1
-            while true; do
-              resp=$(curl -sS -H "Authorization: Bearer ${GH_TOKEN}" \
-                -H "Accept: application/vnd.github+json" \
-                "https://api.github.com/repos/${OWNER_REPO}/pulls/${PR_NUMBER}/files?per_page=100&page=${page}")
-              count=$(echo "$resp" | jq 'length')
-              [ "$count" -eq 0 ] && break
-              echo "$resp" | jq -r '.[].filename' >> changed_files.txt
-              page=$((page+1))
-            done
-          else
-            echo "Push / Manual event detected"
-            # 比對這一次 Commit 與上一次 Commit 的差異
-            if git rev-parse HEAD~1 >/dev/null 2>&1; then
-              git diff --name-only HEAD~1 HEAD > changed_files.txt
-            else
-              git ls-files > changed_files.txt
-            fi
-          fi
+          # ACMR = Added / Copied / Modified / Renamed，排除已刪除的檔案
+          git diff --name-only --diff-filter=ACMR "$BASE_SHA" HEAD \
+            | sort -u > changed_files.txt
 
-          # 去除重複並顯示
-          sort -u changed_files.txt -o changed_files.txt || true
-          echo "=== Changed Files List ==="
-          cat changed_files.txt || true
+          echo "=== Changed Files ==="
+          cat changed_files.txt
+          echo "count=$(wc -l < changed_files.txt)" >> "$GITHUB_OUTPUT"
 
-      # 🟢 3. 把變更的檔案複製到 _cortex_changed 資料夾
       - name: Prepare scan directory
+        if: steps.mode.outputs.incremental == 'true' && steps.changes.outputs.count != '0'
         run: |
-          set -eux
-          
-          # 讀取清單並複製檔案
-          while read -r file; do
-            if [ -f "$file" ]; then
-              # 保持目錄結構複製 (例如 src/main.js -> _cortex_changed/src/main.js)
-              mkdir -p "_cortex_changed/$(dirname "$file")"
-              cp "$file" "_cortex_changed/$file"
-            fi
-          done < changed_files.txt || true
+          set -euo pipefail
+          mkdir -p _cortex_changed
+          while IFS= read -r file; do
+            [ -f "$file" ] || continue
+            mkdir -p "_cortex_changed/$(dirname "$file")"
+            cp "$file" "_cortex_changed/$file"
+          done < changed_files.txt
 
-          # 檢查是否有檔案，如果沒有(例如只刪除檔案)，建立一個空檔案避免掃描器報錯
-          FILE_COUNT=$(find _cortex_changed -type f | wc -l || true)
-          echo "Files prepared for scan: $FILE_COUNT"
+          # 一併帶上相依性清單，SCA / 套件掃描才不會因為缺 lock file 失效
+          for manifest in package.json package-lock.json yarn.lock pnpm-lock.yaml \
+                          requirements.txt Pipfile.lock poetry.lock \
+                          go.mod go.sum pom.xml build.gradle Gemfile.lock composer.lock; do
+            [ -f "$manifest" ] && cp "$manifest" "_cortex_changed/" || true
+          done
 
-          if [ "$FILE_COUNT" -eq 0 ]; then
-            echo "No files to scan. Creating placeholder."
-            echo "placeholder" > _cortex_changed/.cortex_placeholder
-          fi
-
-      # 清除舊設定 (Support 建議)
-      - name: Clean Cortex CLI Config
-        run: |
-          rm -rf ~/.cortexcli/APPSEC
+          echo "Files prepared: $(find _cortex_changed -type f | wc -l)"
 
       - name: Download cortexcli
         run: |
-          set -eux
-          # 使用 env 中的正確網址
-          crtx_resp=$(curl -sS "${CORTEX_API_URL}/public_api/v1/unified-cli/releases/download-link?os=linux&architecture=amd64" \
+          set -eu   # 不要用 -x，避免把 header 內容印進 log
+          crtx_resp=$(curl -sS --fail \
+            "${CORTEX_API_URL}/public_api/v1/unified-cli/releases/download-link?os=linux&architecture=amd64" \
             -H "x-xdr-auth-id: ${CORTEX_API_KEY_ID}" \
             -H "Authorization: ${CORTEX_API_KEY}")
 
           crtx_url=$(echo "$crtx_resp" | jq -r ".signed_url")
-          
           if [ -z "$crtx_url" ] || [ "$crtx_url" = "null" ]; then
             echo "Error: Failed to get signed URL"
             exit 1
           fi
 
-          curl -sS -o cortexcli "$crtx_url"
+          curl -sS --fail -o cortexcli "$crtx_url"
           chmod +x cortexcli
+          ./cortexcli --version    # 官方新版有加，方便對版本
 
-      # 🟢 4. 執行掃描 (關鍵：已加上 --log-level DEBUG)
-      - name: Run Cortex CLI Code Scan (Incremental)
+      - name: Run Cortex CLI Code Scan
+        # PR 沒有任何變更檔（例如只刪檔）就直接跳過，不要送空掃描
+        if: steps.mode.outputs.incremental == 'false' || steps.changes.outputs.count != '0'
         run: |
-          set -eux
-          OUTPUT_PATH="${{ github.workspace }}/result.sarif"
+          set -eu
+          if [ "${{ steps.mode.outputs.incremental }}" = "true" ]; then
+            SCAN_DIR="${{ github.workspace }}/_cortex_changed"
+          else
+            SCAN_DIR="${{ github.workspace }}"
+          fi
+
+          LOG_ARGS=""
+          if [ "${{ inputs.debug }}" = "true" ]; then
+            LOG_ARGS="--log-level DEBUG"
+          fi
 
           ./cortexcli \
-            --log-level DEBUG \
+            $LOG_ARGS \
             --api-base-url "${CORTEX_API_URL}" \
             --api-key "${CORTEX_API_KEY}" \
             --api-key-id "${CORTEX_API_KEY_ID}" \
             code scan \
-            --directory "${{ github.workspace }}/_cortex_changed" \
+            --directory "$SCAN_DIR" \
             --repo-id "${{ github.repository }}" \
             --branch "${{ github.ref_name }}" \
             --source "GITHUB_ACTIONS" \
             --create-repo-if-missing \
             --upload-mode upload \
             --output sarif \
-            --output-file-path "$OUTPUT_PATH"
+            --output-file-path "${{ github.workspace }}/result.sarif"
 
-          test -f "$OUTPUT_PATH"
+          test -f "${{ github.workspace }}/result.sarif"
 
-      # 除錯用：顯示版本
-      - name: Check APPSEC Version
-        if: always()
+      # ── 增量掃描時 SARIF 路徑會變成 _cortex_changed/xxx，要還原成真實路徑 ──
+      - name: Normalize SARIF paths
+        if: steps.mode.outputs.incremental == 'true' && hashFiles('result.sarif') != ''
         run: |
-          if [ -f ~/.cortexcli/APPSEC/version.json ]; then
-            cat ~/.cortexcli/APPSEC/version.json
-          fi
+          set -eu
+          jq '(.. | objects | select(has("uri")) | .uri) |=
+                (sub("^_cortex_changed/"; "") | sub("^.*/_cortex_changed/"; ""))' \
+            result.sarif > result.normalized.sarif
+          mv result.normalized.sarif result.sarif
 
+      - name: Upload SARIF artifact
+        if: always() && hashFiles('result.sarif') != ''
+        uses: actions/upload-artifact@v4
+        with:
+          name: cortex-sarif-${{ github.run_id }}
+          path: result.sarif
+          retention-days: 14
+
+      # ── 只有全量掃描才上傳到 Code Scanning，否則會把沒掃到的檔案的告警標成 fixed ──
       - name: Upload SARIF to GitHub Security
+        if: steps.mode.outputs.incremental == 'false' && hashFiles('result.sarif') != ''
         uses: github/codeql-action/upload-sarif@v4
         with:
           sarif_file: result.sarif
-
-
+          category: cortex-appsec
