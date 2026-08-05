@@ -1,12 +1,43 @@
+# =============================================================================
+# Cortex CLI Code Scan — 只掃本次變更的檔案
+# =============================================================================
+#
+# 【這份 workflow 做什麼】
+#   1. 用 git diff 找出本次 commit / PR 動到哪些檔案
+#   2. 只把這些檔案送給 Cortex CLI 掃描（不掃整個 repo，所以速度快很多）
+#   3. 掃描結果同時上傳到兩個地方：
+#        - Cortex Console（CLI 預設行為）
+#        - GitHub Security 分頁 → Code scanning alerts（SARIF 上傳）
+#
+# 【使用前必須設定的 Repository Secrets】
+#   Settings → Secrets and variables → Actions → New repository secret
+#     CORTEX_API_BASE_URL    Cortex 租戶的 API 網址
+#                            例：https://api-xxxx.xdr.us.paloaltonetworks.com
+#     CORTEX_API_KEY_ID      API Key ID（Cortex 後台 Settings → API Keys 取得）
+#     CORTEX_API_KEY_SECRET  API Key
+#
+# 【注意事項】
+#   - Private / Internal repo 需要啟用 GitHub Code Security（原 Advanced Security）
+#     才能使用 Code scanning。若未啟用，最後一步上傳 SARIF 會失敗並顯示
+#     "GitHub Code Security or GitHub Advanced Security must be enabled..."。
+#     此時可以把最後一步移除，改到 Cortex Console 查看結果。
+#     Public repo 預設已啟用，無須額外設定。
+#   - 增量掃描只分析變更的檔案，跨檔案的關聯分析會受限；
+#     建議另外安排定期的完整掃描作為互補。
+#
+# =============================================================================
+
 name: Cortex CLI Code Scan (Changed Files Only)
 
+# ── 觸發時機 ──────────────────────────────────────────────────────────────
 on:
   push:
     branches:
-      - '**'
-  pull_request:
-  workflow_dispatch:
+      - '**'          # 所有分支。若只想掃主要分支，改成 - main
+  pull_request:       # 開 PR 以及 PR 後續 push 時掃描
+  workflow_dispatch:  # 允許在 Actions 頁面手動執行
 
+# ── 認證資訊（全部來自 Repository Secrets，不會出現在 log 裡）──────────────
 env:
   CORTEX_API_URL: ${{ secrets.CORTEX_API_BASE_URL }}
   CORTEX_API_KEY: ${{ secrets.CORTEX_API_KEY_SECRET }}
@@ -16,17 +47,24 @@ jobs:
   cortex-code-scan:
     runs-on: ubuntu-latest
 
+    # ── 這個 job 需要的權限 ────────────────────────────────────────────────
     permissions:
-      contents: read
-      actions: read
-      security-events: write
+      contents: read          # 讀取程式碼
+      actions: read           # Private repo 上傳 SARIF 時必要
+      security-events: write  # 寫入 Code scanning 告警
 
     steps:
+    # ── 步驟 1：取得原始碼 ────────────────────────────────────────────────
     - name: Checkout Repository
       uses: actions/checkout@v6
       with:
-        fetch-depth: 0          # git diff 需要歷史
+        # 必須設為 0（取得完整 git 歷史），
+        # 預設的淺層 clone 會讓後面的 git diff 抓不到比對基準。
+        fetch-depth: 0
 
+    # ── 步驟 2：安裝 Node.js ──────────────────────────────────────────────
+    # Cortex CLI 的程式碼分析引擎需要 Node.js 執行環境。
+    # 版本固定為 22（官方建議值），避免 runner 映像檔更新時版本飄移。
     - name: Set up Node.js
       uses: actions/setup-node@v6
       with:
@@ -35,19 +73,31 @@ jobs:
     - name: Verify Node.js Version
       run: node -v
 
+    # ── 步驟 3：找出變更的檔案並複製到暫存目錄 ─────────────────────────────
+    # 掃描器接受的是「一個目錄」，所以先把變更檔複製到 _cortex_scan/，
+    # 並保持原本的目錄結構（例：src/main.js → _cortex_scan/src/main.js）。
     - name: Collect changed files
       id: changes
       run: |
         set -e
+
+        # 決定 diff 的比對基準
         if [ "${{ github.event_name }}" = "pull_request" ]; then
+          # PR：跟目標分支（通常是 main）的分岔點比對
           BASE="${{ github.event.pull_request.base.sha }}"
         else
+          # Push：跟推送前的 commit 比對
           BASE="${{ github.event.before }}"
         fi
-        # 新分支 / force push 時 BASE 不存在，退回比上一個 commit
+
+        # 新建分支或 force push 時上面的 BASE 可能不存在，
+        # 退而求其次改用「上一個 commit」；連這個都沒有（首次 commit）
+        # 則用空樹的 hash，等同於把所有檔案視為新增。
         git cat-file -e "${BASE}^{commit}" 2>/dev/null || \
           BASE=$(git rev-parse HEAD~1 2>/dev/null || git hash-object -t tree /dev/null)
 
+        # --diff-filter=ACM：只取「新增 / 複製 / 修改」的檔案，
+        # 排除已刪除的檔案（它們已經不在工作目錄裡了）
         git diff --name-only --diff-filter=ACM "$BASE" HEAD > changed.txt
         echo "=== Changed files ==="
         cat changed.txt
@@ -59,8 +109,12 @@ jobs:
           cp "$f" "_cortex_scan/$f"
         done < changed.txt
 
+        # 把檔案數量傳給後續步驟；為 0 時後面的步驟會全部跳過，
+        # 避免對空目錄執行掃描而報錯。
         echo "count=$(find _cortex_scan -type f | wc -l)" >> "$GITHUB_OUTPUT"
 
+    # ── 步驟 4：下載 Cortex CLI ───────────────────────────────────────────
+    # 向 Cortex API 換取一組有時效的下載連結，再取回執行檔。
     - name: Download cortexcli
       if: steps.changes.outputs.count != '0'
       run: |
@@ -71,8 +125,9 @@ jobs:
         crtx_url=$(echo "$crtx_resp" | jq -r ".signed_url")
         curl -sS -o cortexcli "$crtx_url"
         chmod +x cortexcli
-        ./cortexcli --version
+        ./cortexcli --version   # 印出版本，方便日後排查問題
 
+    # ── 步驟 5：執行掃描 ──────────────────────────────────────────────────
     - name: Run Cortex CLI Code Scan
       if: steps.changes.outputs.count != '0'
       run: |
@@ -88,7 +143,22 @@ jobs:
           --create-repo-if-missing \
           --output sarif \
           --output-file-path "${{ github.workspace }}/scan.sarif"
+        # 參數說明：
+        #   --directory              掃描目標目錄（此處為變更檔的暫存目錄）
+        #   --repo-id                Cortex Console 上的專案識別，用 GitHub repo 全名
+        #   --branch                 分支名稱。PR 事件要用 head_ref，
+        #                            否則會顯示成 "123/merge" 這種內部名稱
+        #   --source                 標記來源為 GitHub Actions
+        #   --create-repo-if-missing Cortex 上還沒有這個專案時自動建立
+        #   --output / --output-file-path
+        #                            額外輸出一份 SARIF 檔，供下一步上傳 GitHub
+        # 若要排查問題，可在 ./cortexcli 後面加上 --log-level DEBUG
 
+    # ── 步驟 6：修正 SARIF 內的檔案路徑 ────────────────────────────────────
+    # 因為掃的是 _cortex_scan/ 這個暫存目錄，SARIF 記錄的路徑會是
+    # "_cortex_scan/src/main.js"，而這個路徑在 repo 裡並不存在，
+    # GitHub 會無法把告警對應到正確的檔案與行號。
+    # 這一步把前綴移除，還原成 "src/main.js"。
     - name: Fix SARIF paths
       if: steps.changes.outputs.count != '0'
       run: |
@@ -96,6 +166,7 @@ jobs:
         import json, re
         def fix(o):
             if isinstance(o, dict):
+                # 這個欄位記錄的是掃描當下的絕對路徑基準，還原路徑後不再適用
                 o.pop("originalUriBaseIds", None)
                 return {k: fix(v) for k, v in o.items()}
             if isinstance(o, list):
@@ -106,6 +177,10 @@ jobs:
         json.dump(fix(json.load(open("scan.sarif"))), open("result.sarif", "w"))
         PY
 
+    # ── 步驟 7：上傳到 GitHub Security ────────────────────────────────────
+    # 上傳後可在 Security 分頁 → Code scanning 檢視，
+    # PR 也會在 Files changed 的對應行直接標註。
+    # category 用來區隔不同掃描工具的結果，若日後接入其他工具請使用不同名稱。
     - name: Upload SARIF to GitHub Security
       if: steps.changes.outputs.count != '0'
       uses: github/codeql-action/upload-sarif@v4
